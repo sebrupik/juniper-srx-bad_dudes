@@ -3,16 +3,23 @@ from datetime import time, date, datetime
 import netmiko
 import re
 import sqlite3
-from bad_dudes_config import USERNAME, PASSWORD, IP_ADDRESS
+from bad_dudes_config import USERNAME, PASSWORD, IP_ADDRESS, PREFIX_LIST
 
 MONTHS = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun":6,
           "Jul":7, "Aug":8, "Sep":9, "Oct":10, "Nov":11, "Dec":12}
 SSH_FAILED_LOGIN_REGEX = "(?P<month>\w+)\s+(?P<day>\d+)\s(?P<time>([0-9]{1,2}:){2}[0-9]{1,2})\s+(?P<year>[0-9]{4}).*(?:user ')(?P<user>.*)'\s.*(?:host ')((?P<ip_address>.*)')"
 
 SSH_ACCOUNTS_INSERT = "INSERT INTO ssh_accounts(ssh_account, first_seen) VALUES (?,?)"
+SSH_ACCOUNTS_SELECT_BY_PK = "SELECT * FROM ssh_accounts WHERE pk='{0}'"
+SSH_ACCOUNTS_SELECT_BY_SSH_ACCOUNT = "SELECT * FROM ssh_accounts WHERE ssh_account='{0}'"
 SSH_IP_ADDRESS_INSERT = "INSERT INTO ip_addresses(ip_address, first_seen) VALUES (?,?)"
+SSH_IP_ADDRESS_SELECT_BY_NOT_BLOCKED = "SELECT * FROM ip_addresses WHERE is_blocked='0'"
+SSH_IP_ADDRESS_SELECT_BY_PK = "SELECT * FROM ip_addresses WHERE pk='{0}'"
+SSH_IP_ADDRESS_SELECT_BY_IP_ADDRESS = "SELECT * FROM ip_addresses WHERE ip_address='{0}'"
 SSH_FAILED_LOGIN_INSERT = "INSERT INTO failed_login_log(ip_address, ssh_account, timestamp) VALUES (?,?,?)"
-
+SSH_FAILED_LOGIN_SELECT_BY_IP_ADDRESS = "SELECT * FROM failed_login_log WHERE ip_address='{0}'"
+SSH_FAILED_LOGIN_SELECT_BY_ALL = "SELECT * FROM failed_login_log WHERE ip_address='{0}' AND ssh_account='{1}' AND timestamp='{2}'"
+SSH_FAILED_LOGIN_SELECT_COMP01 = "SELECT COUNT(pk) AS count, ip_address, ssh_account FROM failed_login_log WHERE ip_address='{0}' GROUP BY ssh_account ORDER BY count"
 
 
 def get_hostname(input_str):
@@ -47,44 +54,81 @@ def get_full_match(input_str):
 
     return None
 
-def ssh_get_username(con, match_dict):
+
+def ssh_get_pk(con, select_query, select_column, insert_query, match_dict, should_i_create):
     _cursor = con.cursor()
-    _cursor.execute("SELECT * from ssh_accounts WHERE ssh_account = '{0}'".format(match_dict["username"]))
-    row_user = _cursor.fetchone()
+    _cursor.execute(select_query.format(match_dict[select_column]))
+    row = _cursor.fetchone()
 
-    if row_user is None:
-        _cursor.execute(SSH_ACCOUNTS_INSERT, (match_dict["username"],
-                                              datetime.combine(match_dict["date"], match_dict["time"])))
-        con.commit()
-        _cursor.execute("SELECT pk FROM ssh_accounts WHERE ssh_account='{0}'".format(match_dict["username"]))
-        row_user = _cursor.fetchone()
+    if row is None:
+        if should_i_create:
+            _cursor.execute(insert_query, (match_dict[select_column],
+                                           datetime.combine(match_dict["date"], match_dict["time"])))
+            con.commit()
+            _cursor.execute(select_query.format(match_dict[select_column]))
+            row = _cursor.fetchone()
+        else:
+            return None
 
-    return row_user[0]
-
-
-def ssh_get_ip_address(con, match_dict):
-    _cursor = con.cursor()
-    _cursor.execute("SELECT * from ip_addresses WHERE ip_address = '{0}'".format(match_dict["ip_address"]))
-    row_ip = _cursor.fetchone()
-
-    if row_ip is None:
-        print("we don't have {0}, lets add it".format(match_dict["ip_address"]))
-
-        _cursor.execute(SSH_IP_ADDRESS_INSERT, (match_dict["ip_address"],
-                                                datetime.combine(match_dict["date"], match_dict["time"])))
-        con.commit()
-        _cursor.execute("SELECT pk FROM ip_addresses WHERE ip_address='{0}'".format(match_dict["ip_address"]))
-        row_ip = _cursor.fetchone()
-
-    return row_ip[0]
+    return row[0]
 
 
 def add_to_database(con, match_dict):
     _cursor = con.cursor()
-    _cursor.execute(SSH_FAILED_LOGIN_INSERT, (ssh_get_ip_address(con, match_dict),
-                                              ssh_get_username(con, match_dict),
-                                              datetime.combine(match_dict["date"], match_dict["time"])))
-    con.commit()
+
+    ip_pk = ssh_get_pk(con, SSH_IP_ADDRESS_SELECT_BY_IP_ADDRESS, "ip_address", SSH_IP_ADDRESS_INSERT, match_dict, False)
+    ssh_pk = ssh_get_pk(con, SSH_ACCOUNTS_SELECT_BY_SSH_ACCOUNT, "username", SSH_ACCOUNTS_INSERT, match_dict, False)
+
+    row = None
+    if ip_pk is not None and ssh_pk is not None:
+        _cursor.execute(SSH_FAILED_LOGIN_SELECT_BY_ALL.format(ip_pk, ssh_pk,
+                                                              datetime.combine(match_dict["date"], match_dict["time"])))
+        row = _cursor.fetchone()
+
+    if row is None:
+        ip_pk = ssh_get_pk(con, SSH_IP_ADDRESS_SELECT_BY_IP_ADDRESS, "ip_address",
+                           SSH_IP_ADDRESS_INSERT, match_dict, True)
+        ssh_pk = ssh_get_pk(con, SSH_ACCOUNTS_SELECT_BY_SSH_ACCOUNT, "username",
+                            SSH_ACCOUNTS_INSERT, match_dict, True)
+
+        _cursor.execute(SSH_FAILED_LOGIN_INSERT, (ip_pk,
+                                                  ssh_pk,
+                                                  datetime.combine(match_dict["date"], match_dict["time"])))
+        con.commit()
+    else:
+        print("row already present")
+
+
+def return_first_row_colx(con, select_str, colx):
+    _cursor = con.cursor()
+    _cursor.execute(select_str)
+
+    row = _cursor.fetchone()
+    if row is not None:
+        return row[colx]
+
+    return None
+
+
+def shall_we_block(con, block_list):
+    _cursor = con.cursor()
+    _cursor.execute(SSH_IP_ADDRESS_SELECT_BY_NOT_BLOCKED)
+
+    rows = _cursor.fetchall()
+    for row in rows:
+        _cursor.execute(SSH_FAILED_LOGIN_SELECT_COMP01.format(row[0]))
+        remote_host_rows = _cursor.fetchall()
+
+        row_count = 0
+        for remote_host_row in remote_host_rows:
+            row_count = row_count + 1
+            if row_count >= 3 or remote_host_row[0] > 3:
+                # block ip because 3 failures logged with different accounts.
+                # or block ip because 3 failures logged with the same account
+                block_list.append(return_first_row_colx(con, SSH_IP_ADDRESS_SELECT_BY_PK.format(remote_host_row[1]), 1))
+                break
+
+    return block_list
 
 
 def print_database(con):
@@ -107,7 +151,7 @@ def main():
         con = sqlite3.connect('bad_dudes.db')
         _cursor = con.cursor()
         _cursor.execute("CREATE TABLE ip_addresses (pk INTEGER PRIMARY KEY," +
-                        "ip_address TEXT, first_seen TIMESTAMP)")
+                        "ip_address TEXT, first_seen TIMESTAMP, is_blocked INTEGER DEFAULT 0)")
 
         _cursor.execute("CREATE TABLE ssh_accounts (pk INTEGER PRIMARY KEY," +
                         "ssh_account TEXT, first_seen TIMESTAMP)")
@@ -135,8 +179,26 @@ def main():
         if match_dict is not None:
             add_to_database(con, match_dict)
 
+    # print_database(con)
 
-    print_database(con)
+    block_list = shall_we_block(con, [])
+
+
+    print(block_list)
+
+    # print(device_connection.send_command("configure"))
+    device_connection.config_mode()
+    print(device_connection.find_prompt())
+    j_prompt = device_connection.find_prompt()
+    print(device_connection.send_command(command_string="edit policy-options prefix-list {0}".format(PREFIX_LIST),
+                                         expect_string=j_prompt))
+    for ip in block_list:
+        print("blocking ip: {0}".format(ip))
+        print(device_connection.send_command(command_string="set {0}".format(ip), expect_string=j_prompt))
+
+    print(device_connection.send_command(command_string="commit and-quit", expect_string=j_prompt))
+
+
 
 
 if __name__ == "__main__":
