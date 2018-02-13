@@ -56,6 +56,8 @@ input01 = "admin@CS7-SRX01>"
 input02 = "Jan 30 14:57:37  2018 CS7-SRX01 sshd: SSHD_LOGIN_FAILED: Login failed for user 'FORCE' from host '193.201.224.214'"
 
 
+print(input01[:-1])
+
 print(gethostname(input01))
 print(get_timestamp(input02, gethostname(input01)))
 print(get_username(input02))

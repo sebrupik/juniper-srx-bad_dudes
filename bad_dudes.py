@@ -183,19 +183,17 @@ def main():
 
     block_list = shall_we_block(con, [])
 
-
     print(block_list)
 
-    # print(device_connection.send_command("configure"))
     device_connection.config_mode()
-    print(device_connection.find_prompt())
-    j_prompt = device_connection.find_prompt()
-    print(device_connection.send_command(command_string="edit policy-options prefix-list {0}".format(PREFIX_LIST),
-                                         expect_string=j_prompt))
+    j_prompt = device_connection.find_prompt()[:-1]
+    device_connection.send_command(command_string="edit policy-options prefix-list {0}".format(PREFIX_LIST))
     for ip in block_list:
         print("blocking ip: {0}".format(ip))
-        print(device_connection.send_command(command_string="set {0}".format(ip), expect_string=j_prompt))
+        device_connection.send_command(command_string="set {0}".format(ip))
 
+    # the transition from configuration mode to operational mode and the change of the prompt # to >
+    # confuses netmiko so we must specify a shorter string to search for
     print(device_connection.send_command(command_string="commit and-quit", expect_string=j_prompt))
 
 
