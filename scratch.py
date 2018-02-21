@@ -65,3 +65,7 @@ print(get_ip_address(input02))
 
 match_va = get_full_match(input02)
 print(match_va.group("month"))
+
+
+
+print(set(["aaa", "bbb", "ccc", "ddd"]) - set(["aaa", "bbb"]))

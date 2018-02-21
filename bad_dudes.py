@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from datetime import time, date, datetime
+import json
 import netmiko
 import re
 import sqlite3
@@ -13,13 +14,17 @@ SSH_ACCOUNTS_INSERT = "INSERT INTO ssh_accounts(ssh_account, first_seen) VALUES 
 SSH_ACCOUNTS_SELECT_BY_PK = "SELECT * FROM ssh_accounts WHERE pk='{0}'"
 SSH_ACCOUNTS_SELECT_BY_SSH_ACCOUNT = "SELECT * FROM ssh_accounts WHERE ssh_account='{0}'"
 SSH_IP_ADDRESS_INSERT = "INSERT INTO ip_addresses(ip_address, first_seen) VALUES (?,?)"
-SSH_IP_ADDRESS_SELECT_BY_NOT_BLOCKED = "SELECT * FROM ip_addresses WHERE is_blocked='0'"
+SSH_IP_ADDRESS_UPDATE_IS_BLOCKED = "UPDATE ip_addresses SET is_blocked ='{0}' WHERE pk='{1}'"
+SSH_IP_ADDRESS_SELECT_BY_IS_BLOCKED = "SELECT * FROM ip_addresses WHERE is_blocked='{0}'"
 SSH_IP_ADDRESS_SELECT_BY_PK = "SELECT * FROM ip_addresses WHERE pk='{0}'"
 SSH_IP_ADDRESS_SELECT_BY_IP_ADDRESS = "SELECT * FROM ip_addresses WHERE ip_address='{0}'"
 SSH_FAILED_LOGIN_INSERT = "INSERT INTO failed_login_log(ip_address, ssh_account, timestamp) VALUES (?,?,?)"
 SSH_FAILED_LOGIN_SELECT_BY_IP_ADDRESS = "SELECT * FROM failed_login_log WHERE ip_address='{0}'"
 SSH_FAILED_LOGIN_SELECT_BY_ALL = "SELECT * FROM failed_login_log WHERE ip_address='{0}' AND ssh_account='{1}' AND timestamp='{2}'"
 SSH_FAILED_LOGIN_SELECT_COMP01 = "SELECT COUNT(pk) AS count, ip_address, ssh_account FROM failed_login_log WHERE ip_address='{0}' GROUP BY ssh_account ORDER BY count"
+
+SHOW_PREFIX_LIST_JUNIPER = "show configuration policy-options prefix-list {0}"
+SHOW_LOG_SSH_FAILED_JUNIPER = "show log messages | match SSHD_LOGIN_FAILED | no-more"
 
 
 def get_hostname(input_str):
@@ -73,7 +78,7 @@ def ssh_get_pk(con, select_query, select_column, insert_query, match_dict, shoul
     return row[0]
 
 
-def add_to_database(con, match_dict):
+def add_to_database(con, match_dict, count):
     _cursor = con.cursor()
 
     ip_pk = ssh_get_pk(con, SSH_IP_ADDRESS_SELECT_BY_IP_ADDRESS, "ip_address", SSH_IP_ADDRESS_INSERT, match_dict, False)
@@ -95,8 +100,11 @@ def add_to_database(con, match_dict):
                                                   ssh_pk,
                                                   datetime.combine(match_dict["date"], match_dict["time"])))
         con.commit()
+        count["Added"] = count["Added"]+1
     else:
-        print("row already present")
+        count["Already_present"] = count["Already_present"] + 1
+
+    return count
 
 
 def return_first_row_colx(con, select_str, colx):
@@ -112,7 +120,7 @@ def return_first_row_colx(con, select_str, colx):
 
 def shall_we_block(con, block_list):
     _cursor = con.cursor()
-    _cursor.execute(SSH_IP_ADDRESS_SELECT_BY_NOT_BLOCKED)
+    _cursor.execute(SSH_IP_ADDRESS_SELECT_BY_IS_BLOCKED.format(0))
 
     rows = _cursor.fetchall()
     for row in rows:
@@ -126,7 +134,10 @@ def shall_we_block(con, block_list):
                 # block ip because 3 failures logged with different accounts.
                 # or block ip because 3 failures logged with the same account
                 block_list.append(return_first_row_colx(con, SSH_IP_ADDRESS_SELECT_BY_PK.format(remote_host_row[1]), 1))
+                print("Trying to block IP PK {0}".format(remote_host_row[1]))
+                _cursor.execute(SSH_IP_ADDRESS_UPDATE_IS_BLOCKED.format(1, remote_host_row[1]))
                 break
+        con.commit()
 
     return block_list
 
@@ -140,6 +151,76 @@ def print_database(con):
         print(row)
 
 
+def get_device_prefix_list(device_type, prefix_output):
+    new_ar = []
+    if device_type == "juniper":
+        for d in prefix_output:
+            if len(d) > 0:
+                new_ar.append(d[:-1])
+
+    return new_ar
+
+
+def get_db_bad_dudes_prefix_list(con):
+    new_ar = []
+    _cursor = con.cursor()
+    _cursor.execute(SSH_IP_ADDRESS_SELECT_BY_IS_BLOCKED.format(1))
+
+    rows = _cursor.fetchall()
+    for row in rows:
+        new_ar.append("{0}/{1}".format(row[1], row[2]))
+
+    return new_ar
+
+
+def device_prefix_list_add_juniper(device_conn, block_list):
+    device_conn.config_mode()
+    j_prompt = device_conn.find_prompt()[:-1]
+    device_conn.send_command(command_string="edit policy-options prefix-list {0}".format(PREFIX_LIST))
+    for ip in block_list:
+        print("blocking ip: {0}".format(ip))
+        device_conn.send_command(command_string="set {0}".format(ip))
+
+    # the transition from configuration mode to operational mode and the change of the prompt # to >
+    # confuses netmiko so we must specify a shorter string to search for
+    print(device_conn.send_command(command_string="commit and-quit", expect_string=j_prompt))
+
+
+def process_device(con, device_dict, show_prefix_list, show_log_ssh_failed):
+    device_conn = netmiko.ConnectHandler(device_type=device_dict["TYPE"],
+                                         ip=device_dict["IP_ADDRESS"],
+                                         username=device_dict["USERNAME"],
+                                         password=device_dict["PASSWORD"])
+
+    installed_p_l = get_device_prefix_list(device_dict["TYPE"],
+                                           device_conn.send_command(show_prefix_list.format(PREFIX_LIST)).splitlines())
+    # print(installed_p_l)
+
+    list_diff = set(get_db_bad_dudes_prefix_list(con)) - set(installed_p_l)
+    if len(list_diff) > 0:
+        print("DB has prefixes that device doesn't")
+        print("Difference between DB and device: {0}".format(list(list_diff)))
+    else:
+        print("Device/ DB prefix lists match")
+
+    ssh_output = device_conn.send_command(show_log_ssh_failed)
+
+    count = {"Added": 0, "Already_present": 0}
+    for line in ssh_output.splitlines():
+        match_dict = get_full_match(line)
+        if match_dict is not None:
+            count = add_to_database(con, match_dict, count)
+
+    print("Syslog entries added to DB: {0}".format(count))
+
+    block_list = shall_we_block(con, list(list_diff))
+    print("Block list: {0}".format(block_list))
+
+    if len(block_list) > 0:
+        if device_dict["TYPE"] == "juniper":
+            device_prefix_list_add_juniper(device_conn, block_list)
+
+
 def main():
     con = sqlite3.connect('bad_dudes.db')
     _cursor = con.cursor()
@@ -151,7 +232,7 @@ def main():
         con = sqlite3.connect('bad_dudes.db')
         _cursor = con.cursor()
         _cursor.execute("CREATE TABLE ip_addresses (pk INTEGER PRIMARY KEY," +
-                        "ip_address TEXT, first_seen TIMESTAMP, is_blocked INTEGER DEFAULT 0)")
+                        "ip_address TEXT, prefix INTEGER DEFAULT 32, first_seen TIMESTAMP, is_blocked INTEGER DEFAULT 0)")
 
         _cursor.execute("CREATE TABLE ssh_accounts (pk INTEGER PRIMARY KEY," +
                         "ssh_account TEXT, first_seen TIMESTAMP)")
@@ -162,41 +243,14 @@ def main():
                         "FOREIGN KEY (ip_address) REFERENCES ip_addresses(pk)," +
                         "FOREIGN KEY (ssh_account) REFERENCES ssh_accounts(pk))")
 
-    device_connection = netmiko.ConnectHandler(device_type="juniper",
-                                               ip=IP_ADDRESS,
-                                               username=USERNAME,
-                                               password=PASSWORD)
-
-    ssh_output = device_connection.send_command("show log messages | match SSHD_LOGIN_FAILED | no-more")
-
-    count = 0
-    for line in ssh_output.splitlines():
-        print("{0}, {1}".format(count, line))
-        count = count + 1
-
-        match_dict = get_full_match(line)
-        print(match_dict)
-        if match_dict is not None:
-            add_to_database(con, match_dict)
-
-    # print_database(con)
-
-    block_list = shall_we_block(con, [])
-
-    print(block_list)
-
-    device_connection.config_mode()
-    j_prompt = device_connection.find_prompt()[:-1]
-    device_connection.send_command(command_string="edit policy-options prefix-list {0}".format(PREFIX_LIST))
-    for ip in block_list:
-        print("blocking ip: {0}".format(ip))
-        device_connection.send_command(command_string="set {0}".format(ip))
-
-    # the transition from configuration mode to operational mode and the change of the prompt # to >
-    # confuses netmiko so we must specify a shorter string to search for
-    print(device_connection.send_command(command_string="commit and-quit", expect_string=j_prompt))
-
-
+    with open("bad_dudes_config2.json", "r") as json_file:
+        data = json.load(json_file)
+        for device in data["DEVICES"]:
+            try:
+                if device["TYPE"] == "juniper":
+                    process_device(con, device, SHOW_PREFIX_LIST_JUNIPER, SHOW_LOG_SSH_FAILED_JUNIPER)
+            except netmiko.ssh_exception.NetMikoTimeoutException as e1:
+                print(e1)
 
 
 if __name__ == "__main__":
