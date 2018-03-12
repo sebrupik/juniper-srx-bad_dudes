@@ -1,39 +1,53 @@
 #!/usr/bin/env python3
 from datetime import time, date, datetime
+from ipwhois import IPWhois
+import ipwhois
 import json
 import netmiko
 import re
 import sqlite3
 
-MONTHS = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun":6,
-          "Jul":7, "Aug":8, "Sep":9, "Oct":10, "Nov":11, "Dec":12}
-SSH_FAILED_LOGIN_REGEX_JUNIPER = "(?P<month>\w+)\s+(?P<day>\d+)\s(?P<time>([0-9]{1,2}:){2}[0-9]{1,2})\s+(?P<year>[0-9]{4}).*(?:user ')(?P<user>.*)'\s.*(?:host ')((?P<ip_address>.*)')"
+MONTHS = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+          "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
+SSH_FAILED_LOGIN_REGEX_JUNIPER = "(?P<month>\w+)\s+(?P<day>\d+)\s(?P<time>([0-9]{1,2}:){2}[0-9]{1,2})\s+" + \
+                                 "(?P<year>[0-9]{4}).*(?:user ')(?P<user>.*)'\s.*(?:host ')((?P<ip_address>.*)')"
 
+SSH_ACCOUNTS_CREATE = "CREATE TABLE ssh_accounts (pk INTEGER PRIMARY KEY, ssh_account TEXT, first_seen TIMESTAMP)"
 SSH_ACCOUNTS_INSERT = "INSERT INTO ssh_accounts(ssh_account, first_seen) VALUES (?,?)"
 SSH_ACCOUNTS_SELECT_BY_PK = "SELECT * FROM ssh_accounts WHERE pk='{0}'"
 SSH_ACCOUNTS_SELECT_BY_SSH_ACCOUNT = "SELECT * FROM ssh_accounts WHERE ssh_account='{0}'"
-SSH_IP_ADDRESS_INSERT = "INSERT INTO ip_addresses(ip_address, first_seen) VALUES (?,?)"
+
+SSH_IP_ADDRESS_CREATE = """CREATE TABLE ip_addresses (pk INTEGER PRIMARY KEY, ip_address TEXT, 
+                           prefix INTEGER DEFAULT 32, first_seen TIMESTAMP, is_blocked INTEGER DEFAULT 0,
+                           asn_cidr TEXT)"""
+SSH_IP_ADDRESS_INSERT = "INSERT INTO ip_addresses(ip_address, first_seen, asn_cidr) VALUES (?,?,?)"
 SSH_IP_ADDRESS_UPDATE_IS_BLOCKED = "UPDATE ip_addresses SET is_blocked ='{0}' WHERE pk='{1}'"
 SSH_IP_ADDRESS_SELECT_BY_IS_BLOCKED = "SELECT * FROM ip_addresses WHERE is_blocked='{0}'"
 SSH_IP_ADDRESS_SELECT_BY_PK = "SELECT * FROM ip_addresses WHERE pk='{0}'"
 SSH_IP_ADDRESS_SELECT_BY_IP_ADDRESS = "SELECT * FROM ip_addresses WHERE ip_address='{0}'"
+
+SSH_FAILED_LOGIN_CREATE = """CREATE TABLE failed_login_log (pk INTEGER PRIMARY KEY, ip_address INTEGER,
+                             ssh_account INTEGER, timestamp TIMESTAMP,
+                             FOREIGN KEY (ip_address) REFERENCES ip_addresses(pk),
+                             FOREIGN KEY (ssh_account) REFERENCES ssh_accounts(pk))"""
 SSH_FAILED_LOGIN_INSERT = "INSERT INTO failed_login_log(ip_address, ssh_account, timestamp) VALUES (?,?,?)"
 SSH_FAILED_LOGIN_SELECT_BY_IP_ADDRESS = "SELECT * FROM failed_login_log WHERE ip_address='{0}'"
-SSH_FAILED_LOGIN_SELECT_BY_ALL = "SELECT * FROM failed_login_log WHERE ip_address='{0}' AND ssh_account='{1}' AND timestamp='{2}'"
-SSH_FAILED_LOGIN_SELECT_COMP01 = "SELECT COUNT(pk) AS count, ip_address, ssh_account FROM failed_login_log WHERE ip_address='{0}' GROUP BY ssh_account ORDER BY count"
+SSH_FAILED_LOGIN_SELECT_BY_ALL = """SELECT * FROM failed_login_log
+                                    WHERE ip_address='{0}' AND ssh_account='{1}' AND timestamp='{2}'"""
+
+SSH_FAILED_LOGIN_SELECT_COMP01 = """SELECT COUNT(pk) AS count, ip_address, ssh_account FROM failed_login_log 
+                                    WHERE ip_address='{0}' GROUP BY ssh_account ORDER BY count"""
+
+ASN_CIDR_CREATE = "CREATE TABLE asn_cidr (pk INTEGER PRIMARY KEY, cidr TEXT, FOREIGN KEY (asn) REFERENCES asns(pk))"
 ASN_CIDR_SELECT_BY_CIDR = "SELECT * FROM asn_cidr WHERE cidr='{0}'"
+ASN_CIDR_INSERT = "INSERT INTO asn_cidr(cidr, asn) VALUES (?,?)"
+
+ASNS_CREATE = "CREATE TABLE asns (pk INTEGER PRIMARY KEY, asn INTEGER, asn_country_code TEXT, asn_desc TEXT"
 ASNS_SELECT_BY_ASN = "SELECT * FROM asns WHERE asn='{0}'"
+ASNS_INSERT = "INSERT INTO asns(asn, asn_country_code, asn_desc) VALUES (?,?,?)"
 
 SHOW_PREFIX_LIST_JUNIPER = "show configuration policy-options prefix-list {0}"
 SHOW_LOG_SSH_FAILED_JUNIPER = "show log messages | match SSHD_LOGIN_FAILED | no-more"
-
-
-def get_hostname(input_str):
-    match = re.search('[@](.*)[>]', input_str)
-    if match:
-        return match.group(1)
-
-    return None
 
 
 def get_timestamp(match, datetime_obj):
@@ -48,10 +62,11 @@ def get_timestamp(match, datetime_obj):
     return None
 
 
-def get_full_match(input_str, type):
-    if type == "juniper":
+def get_full_match(input_str, dev_type):
+    match = None
+    if dev_type == "juniper":
         match = re.search(SSH_FAILED_LOGIN_REGEX_JUNIPER, input_str)
-    elif type == "cisco":
+    elif dev_type == "cisco":
         print("a cisco!")
     if match:
         match_dict = get_timestamp(match, {})
@@ -64,20 +79,72 @@ def get_full_match(input_str, type):
     return None
 
 
-def ssh_get_pk(con, select_query, select_column, insert_query, match_dict, should_i_create):
+def ssh_get_pk(con, select_query, select_column, insert_query, match_dict, should_i_create, row_data=None):
     _cursor = con.cursor()
     _cursor.execute(select_query.format(match_dict[select_column]))
     row = _cursor.fetchone()
 
     if row is None:
         if should_i_create:
-            _cursor.execute(insert_query, (match_dict[select_column],
-                                           datetime.combine(match_dict["date"], match_dict["time"])))
+            if row_data is None:
+                _cursor.execute(insert_query, (match_dict[select_column],
+                                               datetime.combine(match_dict["date"], match_dict["time"])))
+            else:
+                _cursor.execute(insert_query, row_data)
+
             con.commit()
             _cursor.execute(select_query.format(match_dict[select_column]))
             row = _cursor.fetchone()
         else:
             return None
+
+    return row[0]
+
+
+def whois_this(ip):
+    obj = IPWhois(ip)
+    try:
+        results = obj.lookup_rdap(depth=1)
+
+        return {"asn": results["asn"], "asn_cidr": results["asn_cidr"],
+                "asn_country_code": results["asn_country_code"], "asn_description": results["asn_description"]}
+    except ipwhois.exceptions.HTTPLookupError as hle:
+        print(hle)
+        return None
+
+
+def get_asn_cidr_pk(con, ip):
+    _cursor = con.cursor()
+
+    # lets see if we have the ASN number already and save time by not doing the whois query
+    asn_cidr_pk = return_first_row_colx(con, SSH_IP_ADDRESS_SELECT_BY_IP_ADDRESS, 5, ip)
+    if asn_cidr_pk is not None:
+        print("we've got it already!")
+        return asn_cidr_pk
+
+    w_res = whois_this(ip)
+
+    if w_res is None:
+        return None
+
+    row = None
+    while row is None:
+        _cursor.execute(ASNS_SELECT_BY_ASN.format(w_res["asn"]))
+        row = _cursor.fetchone()
+        if row is None:
+            _cursor.execute(ASNS_INSERT, (w_res["asn"], w_res["asn_country_code"], w_res["asn_description"]))
+            con.commit()
+
+    asn_pk = row[0]
+    print("ASN row pk for {0} is: {1}".format(ip, asn_pk))
+
+    row = None
+    while row is None:
+        _cursor.execute(ASN_CIDR_SELECT_BY_CIDR.format(w_res["asn_cidr"]))
+        row = _cursor.fetchone()
+        if row is None:
+            _cursor.execute(ASN_CIDR_INSERT, (w_res["asn_cidr"], asn_pk))
+            con.commit()
 
     return row[0]
 
@@ -96,7 +163,10 @@ def add_to_database(con, match_dict, count):
 
     if row is None:
         ip_pk = ssh_get_pk(con, SSH_IP_ADDRESS_SELECT_BY_IP_ADDRESS, "ip_address",
-                           SSH_IP_ADDRESS_INSERT, match_dict, True)
+                           SSH_IP_ADDRESS_INSERT, match_dict, True, (match_dict["ip_address"],
+                                                                     datetime.combine(match_dict["date"],
+                                                                                      match_dict["time"]),
+                                                                     get_asn_cidr_pk(con, match_dict["ip_address"])))
         ssh_pk = ssh_get_pk(con, SSH_ACCOUNTS_SELECT_BY_SSH_ACCOUNT, "username",
                             SSH_ACCOUNTS_INSERT, match_dict, True)
 
@@ -111,8 +181,10 @@ def add_to_database(con, match_dict, count):
     return count
 
 
-def return_first_row_colx(con, select_str, colx):
+def return_first_row_colx(con, select_str, colx, select_arg=None):
     _cursor = con.cursor()
+    if select_arg is not None:
+        select_str.format(select_arg)
     _cursor.execute(select_str)
 
     row = _cursor.fetchone()
@@ -235,30 +307,18 @@ def main():
         # build the tables
         con = sqlite3.connect('bad_dudes.db')
         _cursor = con.cursor()
-        _cursor.execute("CREATE TABLE ip_addresses (pk INTEGER PRIMARY KEY," +
-                        "ip_address TEXT, prefix INTEGER DEFAULT 32, first_seen TIMESTAMP, is_blocked INTEGER DEFAULT 0)")
-
-        _cursor.execute("CREATE TABLE ssh_accounts (pk INTEGER PRIMARY KEY," +
-                        "ssh_account TEXT, first_seen TIMESTAMP)")
-
-        _cursor.execute("CREATE TABLE failed_login_log (pk INTEGER PRIMARY KEY," +
-                        "ip_address INTEGER, ssh_account INTEGER," +
-                        "timestamp TIMESTAMP," +
-                        "FOREIGN KEY (ip_address) REFERENCES ip_addresses(pk)," +
-                        "FOREIGN KEY (ssh_account) REFERENCES ssh_accounts(pk))")
-
-        _cursor.execute("CREATE TABLE asns (pk INTEGER PRIMARY KEY, asn INTEGER," +
-                        "asn_country_code TEXT, asn_desc TEXT")
-
-        _cursor.execute("CREATE TABLE asn_cidr (pk INTEGER PRIMARY KEY, cidr TEXT," +
-                        "FOREIGN KEY (asn) REFERENCES asns(pk))")
+        _cursor.execute(SSH_IP_ADDRESS_CREATE)
+        _cursor.execute(SSH_ACCOUNTS_CREATE)
+        _cursor.execute(SSH_FAILED_LOGIN_CREATE)
+        _cursor.execute(ASNS_CREATE)
+        _cursor.execute(ASN_CIDR_CREATE)
 
     with open("bad_dudes_config2.json", "r") as json_file:
-        data = json.load(json_file)
-        for device in data["DEVICES"]:
+        d = json.load(json_file)
+        for device in d["DEVICES"]:
             try:
                 if device["TYPE"] == "juniper":
-                    process_device(con, device, SHOW_PREFIX_LIST_JUNIPER, SHOW_LOG_SSH_FAILED_JUNIPER, data["PREFIX_LIST"])
+                    process_device(con, device, SHOW_PREFIX_LIST_JUNIPER, SHOW_LOG_SSH_FAILED_JUNIPER, d["PREFIX_LIST"])
             except netmiko.ssh_exception.NetMikoTimeoutException as e1:
                 print(e1)
 
