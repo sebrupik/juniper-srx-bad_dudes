@@ -119,7 +119,6 @@ def get_asn_cidr_pk(con, ip):
     # lets see if we have the ASN number already and save time by not doing the whois query
     asn_cidr_pk = return_first_row_colx(con, SSH_IP_ADDRESS_SELECT_BY_IP_ADDRESS, 5, ip)
     if asn_cidr_pk is not None:
-        print("we've got it already!")
         return asn_cidr_pk
 
     w_res = whois_this(ip)
@@ -184,7 +183,7 @@ def add_to_database(con, match_dict, count):
 def return_first_row_colx(con, select_str, colx, select_arg=None):
     _cursor = con.cursor()
     if select_arg is not None:
-        select_str.format(select_arg)
+        select_str = select_str.format(select_arg)
     _cursor.execute(select_str)
 
     row = _cursor.fetchone()
