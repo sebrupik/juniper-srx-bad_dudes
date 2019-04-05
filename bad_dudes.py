@@ -38,11 +38,12 @@ SSH_FAILED_LOGIN_SELECT_BY_ALL = """SELECT * FROM failed_login_log
 SSH_FAILED_LOGIN_SELECT_COMP01 = """SELECT COUNT(pk) AS count, ip_address, ssh_account FROM failed_login_log 
                                     WHERE ip_address='{0}' GROUP BY ssh_account ORDER BY count"""
 
-ASN_CIDR_CREATE = "CREATE TABLE asn_cidr (pk INTEGER PRIMARY KEY, cidr TEXT, FOREIGN KEY (asn) REFERENCES asns(pk))"
+ASN_CIDR_CREATE = "CREATE TABLE asn_cidr (pk INTEGER PRIMARY KEY, cidr TEXT, asn INTEGER, " \
+                  "FOREIGN KEY (asn) REFERENCES asns(pk))"
 ASN_CIDR_SELECT_BY_CIDR = "SELECT * FROM asn_cidr WHERE cidr='{0}'"
 ASN_CIDR_INSERT = "INSERT INTO asn_cidr(cidr, asn) VALUES (?,?)"
 
-ASNS_CREATE = "CREATE TABLE asns (pk INTEGER PRIMARY KEY, asn INTEGER, asn_country_code TEXT, asn_desc TEXT"
+ASNS_CREATE = "CREATE TABLE asns (pk INTEGER PRIMARY KEY, asn INTEGER, asn_country_code TEXT, asn_desc TEXT)"
 ASNS_SELECT_BY_ASN = "SELECT * FROM asns WHERE asn='{0}'"
 ASNS_INSERT = "INSERT INTO asns(asn, asn_country_code, asn_desc) VALUES (?,?,?)"
 

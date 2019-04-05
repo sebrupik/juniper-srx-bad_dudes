@@ -2,3 +2,5 @@
 /bad_dudes_config.py
 /bad_dudes.db
 /bad_dudes_config2.json
+.idea/
+__pycache__/

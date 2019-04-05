@@ -1,3 +1,3 @@
-USERNAME=username
-PASSWORD=password
-IP_ADDRESS=1.1.1.1
+USERNAME="username"
+PASSWORD="password"
+IP_ADDRESS="1.1.1.1"
