@@ -77,6 +77,7 @@ def get_full_match(input_str, dev_type):
 
             return match_dict
 
+    print("get_full_match found no regex matches!!")
     return None
 
 
@@ -281,6 +282,7 @@ def process_device(con, device_dict, show_prefix_list, show_log_ssh_failed, pref
     ssh_output = device_conn.send_command(show_log_ssh_failed)
 
     count = {"Added": 0, "Already_present": 0}
+    print("Processing {0} lines".format(ssh_output.splitlines()))
     for line in ssh_output.splitlines():
         match_dict = get_full_match(line, device_dict["TYPE"])
         if match_dict is not None:
